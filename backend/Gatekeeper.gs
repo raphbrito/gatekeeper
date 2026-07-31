@@ -73,8 +73,8 @@ function validateEmail(email) {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeEmail(email))) throw apiError('E-mail inválido.', 'INVALID_EMAIL', 400);
 }
 function validatePassword(password) {
-  if (typeof password !== 'string' || password.length < 8 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) {
-    throw apiError('A senha deve ter ao menos 8 caracteres, uma letra e um numero.', 'WEAK_PASSWORD', 400);
+  if (typeof password !== 'string' || password.length < 8 || !/[a-z]/.test(password) || !/[A-Z]/.test(password) || !/\d/.test(password)) {
+    throw apiError('A senha deve ter ao menos 8 caracteres, com letra maiuscula, minuscula e numero.', 'WEAK_PASSWORD', 400);
   }
 }
 function apiError(message, code, status) { return { isApiError: true, message: message, code: code, status: status || 400 }; }
