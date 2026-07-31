@@ -59,6 +59,29 @@ function acceptRegistrationInvite(payload) {
   return success('Cadastro concluido. Voce ja pode entrar.', { user: publicUser(user) }, 201);
 }
 
+function listUsersForAdmin(token) {
+  requireInviteAdmin(token);
+  return success('Usuarios carregados.', { users: sheetRows(APP_CONFIG.SHEETS.USERS).map(function (user) {
+    return { id: user.id_usuario, name: user.nome, lastName: user.sobrenome, email: user.email, status: user.status, createdAt: user.criado_em, lastLoginAt: user.ultimo_login_em };
+  }) });
+}
+
+function deleteUserForAdmin(payload, token) {
+  requireFields(payload, ['userId']);
+  var session = requireSession(token), target = getUserById(payload.userId);
+  if (!target) throw apiError('Usuario nao encontrado.', 'USER_NOT_FOUND', 404);
+  if (target.id_usuario === session.id_usuario) throw apiError('Voce nao pode excluir sua propria conta.', 'CANNOT_DELETE_SELF', 400);
+  sheetRows(APP_CONFIG.SHEETS.SESSIONS).filter(function (item) { return item.id_usuario === target.id_usuario; }).sort(function (a, b) { return b._row - a._row; }).forEach(function (item) { clearSessionCache(item.token); deleteRow(APP_CONFIG.SHEETS.SESSIONS, item._row); });
+  sheetRows(APP_CONFIG.SHEETS.VALIDATIONS).filter(function (item) { return item.id_usuario === target.id_usuario; }).sort(function (a, b) { return b._row - a._row; }).forEach(function (item) { deleteRow(APP_CONFIG.SHEETS.VALIDATIONS, item._row); });
+  deleteRow(APP_CONFIG.SHEETS.USERS, target._row);
+  logEvent('USUARIO_EXCLUIDO_POR_ADMIN', session.id_usuario, 'Conta removida: ' + target.email + '.');
+  return success('Usuario excluido.');
+}
+
+function publicRegistrationDisabled() {
+  throw apiError('Novas contas sao criadas somente por convite.', 'INVITE_REQUIRED', 403);
+}
+
 function register(payload) {
   requireFields(payload, ['nome', 'sobrenome', 'email', 'senha', 'confirmarSenha']); validateEmail(payload.email); validatePassword(payload.senha);
   if (payload.senha !== payload.confirmarSenha) throw apiError('As senhas não coincidem.', 'PASSWORD_MISMATCH', 400);

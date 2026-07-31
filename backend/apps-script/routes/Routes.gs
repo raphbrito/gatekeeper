@@ -1,8 +1,10 @@
 function routeRequest(method, route, payload, token) {
   var routes = {
-    'POST:register': function () { return register(payload); },
+    'POST:register': function () { return publicRegistrationDisabled(); },
     'POST:create-registration-invite': function () { return createRegistrationInvite(payload, token); },
     'POST:accept-registration-invite': function () { return acceptRegistrationInvite(payload); },
+    'GET:admin-users': function () { return listUsersForAdmin(token); },
+    'POST:admin-delete-user': function () { return deleteUserForAdmin(payload, token); },
     'POST:login': function () { return login(payload); },
     'POST:confirm-registration': function () { return confirmRegistration(payload.token); },
     'GET:verify-email': function () { return confirmRegistration(payload.token); },

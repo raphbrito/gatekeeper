@@ -29,3 +29,7 @@ function updateRow(sheetName, rowNumber, changes) {
   Object.keys(changes).forEach(function (key) { if (headers.indexOf(key) !== -1) record[key] = changes[key]; });
   sheet.getRange(rowNumber, 1, 1, headers.length).setValues([headers.map(function (header) { return record[header] === undefined ? '' : record[header]; })]);
 }
+function deleteRow(sheetName, rowNumber) {
+  getSpreadsheet().getSheetByName(sheetName).deleteRow(rowNumber);
+  if (REQUEST_CONTEXT) delete REQUEST_CONTEXT.rows[sheetName];
+}

@@ -73,7 +73,9 @@ function validateEmail(email) {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeEmail(email))) throw apiError('E-mail inválido.', 'INVALID_EMAIL', 400);
 }
 function validatePassword(password) {
-  if (typeof password !== 'string' || password.length < 8) throw apiError('A senha deve ter ao menos 8 caracteres.', 'WEAK_PASSWORD', 400);
+  if (typeof password !== 'string' || password.length < 8 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) {
+    throw apiError('A senha deve ter ao menos 8 caracteres, uma letra e um numero.', 'WEAK_PASSWORD', 400);
+  }
 }
 function apiError(message, code, status) { return { isApiError: true, message: message, code: code, status: status || 400 }; }
 
@@ -170,6 +172,10 @@ function updateRow(sheetName, rowNumber, changes) {
   if (!record) throw apiError('Registro nao encontrado.', 'DATABASE_ERROR', 500);
   Object.keys(changes).forEach(function (key) { if (headers.indexOf(key) !== -1) record[key] = changes[key]; });
   sheet.getRange(rowNumber, 1, 1, headers.length).setValues([headers.map(function (header) { return record[header] === undefined ? '' : record[header]; })]);
+}
+function deleteRow(sheetName, rowNumber) {
+  getSpreadsheet().getSheetByName(sheetName).deleteRow(rowNumber);
+  if (REQUEST_CONTEXT) delete REQUEST_CONTEXT.rows[sheetName];
 }
 
 
@@ -401,6 +407,24 @@ function acceptRegistrationInvite(payload) {
   return success('Cadastro concluido. Voce ja pode entrar.', { user: publicUser(user) }, 201);
 }
 
+function listUsersForAdmin(token) {
+  requireInviteAdmin(token);
+  return success('Usuarios carregados.', { users: sheetRows(APP_CONFIG.SHEETS.USERS).map(function (user) {
+    return { id: user.id_usuario, name: user.nome, lastName: user.sobrenome, email: user.email, status: user.status, createdAt: user.criado_em, lastLoginAt: user.ultimo_login_em };
+  }) });
+}
+function deleteUserForAdmin(payload, token) {
+  requireFields(payload, ['userId']);
+  var session = requireSession(token), target = getUserById(payload.userId);
+  if (!target) throw apiError('Usuario nao encontrado.', 'USER_NOT_FOUND', 404);
+  if (target.id_usuario === session.id_usuario) throw apiError('Voce nao pode excluir sua propria conta.', 'CANNOT_DELETE_SELF', 400);
+  sheetRows(APP_CONFIG.SHEETS.SESSIONS).filter(function (item) { return item.id_usuario === target.id_usuario; }).sort(function (a, b) { return b._row - a._row; }).forEach(function (item) { clearSessionCache(item.token); deleteRow(APP_CONFIG.SHEETS.SESSIONS, item._row); });
+  sheetRows(APP_CONFIG.SHEETS.VALIDATIONS).filter(function (item) { return item.id_usuario === target.id_usuario; }).sort(function (a, b) { return b._row - a._row; }).forEach(function (item) { deleteRow(APP_CONFIG.SHEETS.VALIDATIONS, item._row); });
+  deleteRow(APP_CONFIG.SHEETS.USERS, target._row); logEvent('USUARIO_EXCLUIDO_POR_ADMIN', session.id_usuario, 'Conta removida: ' + target.email + '.');
+  return success('Usuario excluido.');
+}
+function publicRegistrationDisabled() { throw apiError('Novas contas sao criadas somente por convite.', 'INVITE_REQUIRED', 403); }
+
 function register(payload) {
   requireFields(payload, ['nome', 'sobrenome', 'email', 'senha', 'confirmarSenha']); validateEmail(payload.email); validatePassword(payload.senha);
   if (payload.senha !== payload.confirmarSenha) throw apiError('As senhas não coincidem.', 'PASSWORD_MISMATCH', 400);
@@ -487,9 +511,11 @@ function resetPassword(payload) {
 // ===== backend\apps-script\routes\Routes.gs =====
 function routeRequest(method, route, payload, token) {
   var routes = {
-    'POST:register': function () { return register(payload); },
+    'POST:register': function () { return publicRegistrationDisabled(); },
     'POST:create-registration-invite': function () { return createRegistrationInvite(payload, token); },
     'POST:accept-registration-invite': function () { return acceptRegistrationInvite(payload); },
+    'GET:admin-users': function () { return listUsersForAdmin(token); },
+    'POST:admin-delete-user': function () { return deleteUserForAdmin(payload, token); },
     'POST:login': function () { return login(payload); },
     'POST:confirm-registration': function () { return confirmRegistration(payload.token); },
     'GET:verify-email': function () { return confirmRegistration(payload.token); },
