@@ -1,6 +1,8 @@
 function routeRequest(method, route, payload, token) {
   var routes = {
     'POST:register': function () { return register(payload); },
+    'POST:create-registration-invite': function () { return createRegistrationInvite(payload, token); },
+    'POST:accept-registration-invite': function () { return acceptRegistrationInvite(payload); },
     'POST:login': function () { return login(payload); },
     'POST:confirm-registration': function () { return confirmRegistration(payload.token); },
     'GET:verify-email': function () { return confirmRegistration(payload.token); },

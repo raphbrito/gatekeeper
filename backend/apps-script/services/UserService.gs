@@ -15,7 +15,7 @@ function requestEmailChange(token, payload) {
   var session = requireSession(token), user = getUserById(session.id_usuario); requireFields(payload, ['email', 'senha']); validateEmail(payload.email);
   var email = normalizeEmail(payload.email); if (!verifyPassword(payload.senha, user.senha_hash)) throw apiError('Senha atual inválida.', 'INVALID_CREDENTIALS', 401);
   if (getUserByEmail(email)) throw apiError('Este e-mail já está cadastrado.', 'EMAIL_ALREADY_EXISTS', 409);
-  var validation = createValidation(user, VALIDATION_TYPE.EMAIL_CHANGE, email); sendValidationEmail(validation, user); logEvent('ALTERACAO_EMAIL_SOLICITADA', user.id_usuario, 'Alteração de e-mail solicitada.');
+  var validation = createValidation(user, VALIDATION_TYPE.EMAIL_CHANGE, email); enqueueValidationEmail(validation); logEvent('ALTERACAO_EMAIL_SOLICITADA', user.id_usuario, 'Alteração de e-mail solicitada.');
   return success('Enviamos uma confirmação para o novo e-mail.');
 }
 function confirmEmailChange(token) {
@@ -35,7 +35,7 @@ function forgotPassword(payload) {
   requireFields(payload, ['email']); var user = getUserByEmail(payload.email);
   // Do not reveal whether the address exists.
   if (!user || user.status !== USER_STATUS.ACTIVE) return success('Se o e-mail estiver cadastrado, você receberá as instruções.');
-  var validation = createValidation(user, VALIDATION_TYPE.PASSWORD_RESET, ''); sendValidationEmail(validation, user); logEvent('RECUPERACAO_SENHA', user.id_usuario, 'Recuperação de senha solicitada.');
+  var validation = createValidation(user, VALIDATION_TYPE.PASSWORD_RESET, ''); enqueueValidationEmail(validation); logEvent('RECUPERACAO_SENHA', user.id_usuario, 'Recuperação de senha solicitada.');
   return success('Se o e-mail estiver cadastrado, você receberá as instruções.');
 }
 function resetPassword(payload) {

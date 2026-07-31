@@ -2,6 +2,7 @@ function doGet(event) { return handleRequest('GET', event); }
 function doPost(event) { return handleRequest('POST', event); }
 
 function handleRequest(method, event) {
+  beginRequestContext();
   try {
     var params = (event && event.parameter) || {}, body = {};
     if (event && event.postData && event.postData.contents) body = JSON.parse(event.postData.contents);

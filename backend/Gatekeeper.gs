@@ -8,6 +8,11 @@ const APP_CONFIG = {
   API_VERSION: 'v1',
   SPREADSHEET_ID_PROPERTY: 'GATEKEEPER_SPREADSHEET_ID',
   FRONTEND_URL_PROPERTY: 'GATEKEEPER_FRONTEND_URL',
+  INVITE_ADMIN_EMAILS_PROPERTY: 'GATEKEEPER_INVITE_ADMIN_EMAILS',
+  EMAIL_QUEUE_PROPERTY: 'GATEKEEPER_EMAIL_QUEUE',
+  EMAIL_QUEUE_HANDLER: 'processEmailQueue',
+  EMAIL_REMINDER_HANDLER: 'processRegistrationEmailReminders',
+  SESSION_CACHE_TTL_SECONDS: 300,
   SESSION_TTL_MS: 60 * 60 * 1000,
   TOKEN_TTL_MS: {
     CONFIRMACAO_CADASTRO: 24 * 60 * 60 * 1000,
@@ -15,12 +20,13 @@ const APP_CONFIG = {
     RECUPERACAO_SENHA: 30 * 60 * 1000
   },
   SHEETS: {
-    USERS: 'Usuarios', VALIDATIONS: 'Validacoes', SESSIONS: 'Sessoes', LOGS: 'Logs'
+    USERS: 'Usuarios', VALIDATIONS: 'Validacoes', SESSIONS: 'Sessoes', INVITES: 'Convites', LOGS: 'Logs'
   },
   HEADERS: {
     Usuarios: ['id_usuario', 'nome', 'sobrenome', 'email', 'email_confirmado_em', 'senha_hash', 'status', 'criado_em', 'ultimo_login_em'],
-    Validacoes: ['id_validacao', 'id_usuario', 'tipo', 'valor', 'token', 'status', 'criado_em', 'expira_em', 'utilizado_em'],
+    Validacoes: ['id_validacao', 'id_usuario', 'tipo', 'valor', 'token', 'status', 'criado_em', 'expira_em', 'utilizado_em', 'lembrete_enviado_em'],
     Sessoes: ['id_sessao', 'id_usuario', 'token', 'status', 'criado_em', 'ultimo_acesso_em', 'expira_em', 'encerrado_em'],
+    Convites: ['id_convite', 'email', 'token', 'status', 'criado_em', 'expira_em', 'utilizado_em', 'criado_por'],
     Logs: ['id_log', 'id_usuario', 'evento', 'descricao', 'criado_em']
   }
 };
@@ -29,6 +35,8 @@ const USER_STATUS = { PENDING: 'PENDENTE', ACTIVE: 'ATIVO' };
 const VALIDATION_STATUS = { PENDING: 'PENDENTE', USED: 'UTILIZADO', EXPIRED: 'EXPIRADO', REPLACED: 'SUBSTITUIDO' };
 const SESSION_STATUS = { ACTIVE: 'ATIVA', EXPIRED: 'EXPIRADA', CLOSED: 'ENCERRADA' };
 const VALIDATION_TYPE = { REGISTRATION: 'CONFIRMACAO_CADASTRO', EMAIL_CHANGE: 'ALTERACAO_EMAIL', PASSWORD_RESET: 'RECUPERACAO_SENHA' };
+const INVITE_STATUS = { PENDING: 'PENDENTE', USED: 'UTILIZADO', EXPIRED: 'EXPIRADO', REPLACED: 'SUBSTITUIDO' };
+var REQUEST_CONTEXT = null;
 
 
 // ===== backend\apps-script\utils\ResponseUtils.gs =====
@@ -72,9 +80,16 @@ function apiError(message, code, status) { return { isApiError: true, message: m
 
 // ===== backend\apps-script\database\Spreadsheet.gs =====
 function getSpreadsheet() {
+  if (REQUEST_CONTEXT && REQUEST_CONTEXT.spreadsheet) return REQUEST_CONTEXT.spreadsheet;
   var id = PropertiesService.getScriptProperties().getProperty(APP_CONFIG.SPREADSHEET_ID_PROPERTY);
   if (!id) throw apiError('Banco de dados não configurado.', 'CONFIGURATION_ERROR', 500);
-  return SpreadsheetApp.openById(id);
+  var spreadsheet = SpreadsheetApp.openById(id);
+  if (REQUEST_CONTEXT) REQUEST_CONTEXT.spreadsheet = spreadsheet;
+  return spreadsheet;
+}
+
+function beginRequestContext() {
+  REQUEST_CONTEXT = { spreadsheet: null, rows: {} };
 }
 
 function initializeDatabase() {
@@ -82,31 +97,63 @@ function initializeDatabase() {
   Object.keys(APP_CONFIG.HEADERS).forEach(function (name) {
     var sheet = spreadsheet.getSheetByName(name) || spreadsheet.insertSheet(name);
     var headers = APP_CONFIG.HEADERS[name];
-    if (sheet.getLastRow() === 0) sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    if (sheet.getLastRow() === 0) {
+      sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+      return;
+    }
+    var existingHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    headers.forEach(function (header) {
+      if (existingHeaders.indexOf(header) === -1) {
+        sheet.getRange(1, existingHeaders.length + 1).setValue(header);
+        existingHeaders.push(header);
+      }
+    });
   });
 }
 
 function configureGatekeeper(spreadsheetId, frontendUrl) {
-  PropertiesService.getScriptProperties().setProperties({
+  var properties = PropertiesService.getScriptProperties();
+  spreadsheetId = spreadsheetId || properties.getProperty(APP_CONFIG.SPREADSHEET_ID_PROPERTY);
+  frontendUrl = frontendUrl || properties.getProperty(APP_CONFIG.FRONTEND_URL_PROPERTY);
+  if (!spreadsheetId || !frontendUrl) throw new Error('Informe o ID da planilha e a URL do frontend na primeira configuração.');
+  properties.setProperties({
     GATEKEEPER_SPREADSHEET_ID: spreadsheetId,
     GATEKEEPER_FRONTEND_URL: frontendUrl.replace(/\/$/, '')
   });
   initializeDatabase();
+  ensureConfirmationReminderTrigger();
+}
+
+function upgradeGatekeeper() {
+  var properties = PropertiesService.getScriptProperties();
+  var spreadsheetId = properties.getProperty(APP_CONFIG.SPREADSHEET_ID_PROPERTY);
+  var frontendUrl = properties.getProperty(APP_CONFIG.FRONTEND_URL_PROPERTY);
+  if (!spreadsheetId || !frontendUrl) throw new Error('A instalação ainda não foi configurada. Execute configureGatekeeper(ID_DA_PLANILHA, URL_DO_FRONTEND) pelo editor de código.');
+  configureGatekeeper(spreadsheetId, frontendUrl);
+}
+
+function configureInviteAdmins(emails) {
+  var normalized = String(emails || '').split(',').map(normalizeEmail).filter(function (email) { return !!email; });
+  if (!normalized.length) throw new Error('Informe ao menos um e-mail administrador.');
+  PropertiesService.getScriptProperties().setProperty(APP_CONFIG.INVITE_ADMIN_EMAILS_PROPERTY, normalized.join(','));
 }
 
 
 // ===== backend\apps-script\repositories\Repository.gs =====
 function sheetRows(sheetName) {
+  if (REQUEST_CONTEXT && REQUEST_CONTEXT.rows[sheetName]) return REQUEST_CONTEXT.rows[sheetName];
   var sheet = getSpreadsheet().getSheetByName(sheetName);
   if (!sheet) throw apiError('Aba não encontrada.', 'DATABASE_ERROR', 500);
   var values = sheet.getDataRange().getValues();
   if (values.length < 2) return [];
   var headers = values[0];
-  return values.slice(1).map(function (row, index) {
+  var rows = values.slice(1).map(function (row, index) {
     var item = { _row: index + 2 };
     headers.forEach(function (header, col) { item[header] = row[col]; });
     return item;
   });
+  if (REQUEST_CONTEXT) REQUEST_CONTEXT.rows[sheetName] = rows;
+  return rows;
 }
 
 function findRow(sheetName, predicate) { return sheetRows(sheetName).find(predicate) || null; }
@@ -114,14 +161,15 @@ function insertRow(sheetName, item) {
   var sheet = getSpreadsheet().getSheetByName(sheetName);
   var headers = APP_CONFIG.HEADERS[sheetName];
   sheet.appendRow(headers.map(function (header) { return item[header] === undefined ? '' : item[header]; }));
+  if (REQUEST_CONTEXT) delete REQUEST_CONTEXT.rows[sheetName];
   return item;
 }
 function updateRow(sheetName, rowNumber, changes) {
   var sheet = getSpreadsheet().getSheetByName(sheetName), headers = APP_CONFIG.HEADERS[sheetName];
-  Object.keys(changes).forEach(function (key) {
-    var col = headers.indexOf(key);
-    if (col !== -1) sheet.getRange(rowNumber, col + 1).setValue(changes[key]);
-  });
+  var record = sheetRows(sheetName).find(function (item) { return item._row === rowNumber; });
+  if (!record) throw apiError('Registro nao encontrado.', 'DATABASE_ERROR', 500);
+  Object.keys(changes).forEach(function (key) { if (headers.indexOf(key) !== -1) record[key] = changes[key]; });
+  sheet.getRange(rowNumber, 1, 1, headers.length).setValues([headers.map(function (header) { return record[header] === undefined ? '' : record[header]; })]);
 }
 
 
@@ -162,16 +210,93 @@ function logEvent(event, userId, description) {
 
 
 // ===== backend\apps-script\services\EmailService.gs =====
-function sendValidationEmail(validation, user) {
+function deliverValidationEmail(validation, user, isReminder) {
   var baseUrl = PropertiesService.getScriptProperties().getProperty(APP_CONFIG.FRONTEND_URL_PROPERTY);
   if (!baseUrl) throw apiError('URL do frontend não configurada.', 'CONFIGURATION_ERROR', 500);
   var isRegistration = validation.tipo === VALIDATION_TYPE.REGISTRATION;
   var page = isRegistration ? 'verify-email.html' : validation.tipo === VALIDATION_TYPE.PASSWORD_RESET ? 'redefinir-senha.html' : 'confirm-email.html';
   var link = baseUrl + '/' + page + '?token=' + encodeURIComponent(validation.token);
-  var subject = isRegistration ? 'Confirme seu cadastro no Gatekeeper' : validation.tipo === VALIDATION_TYPE.PASSWORD_RESET ? 'Redefinição de senha' : 'Confirme seu novo e-mail';
-  MailApp.sendEmail({ to: validation.valor || user.email, subject: subject, htmlBody: '<p>Olá, ' + user.nome + '.</p><p><a href="' + link + '">Clique aqui para continuar</a>.</p><p>Este link expira em ' + validation.expira_em + '.</p>' });
+  var subject = isReminder ? 'Lembrete: confirme seu cadastro no Gatekeeper' : isRegistration ? 'Confirme seu cadastro no Gatekeeper' : validation.tipo === VALIDATION_TYPE.PASSWORD_RESET ? 'Redefinição de senha' : 'Confirme seu novo e-mail';
+  var reminderText = isReminder ? '<p>Seu cadastro ainda está aguardando a confirmação do e-mail.</p>' : '';
+  MailApp.sendEmail({ to: validation.valor || user.email, subject: subject, htmlBody: '<p>Olá, ' + user.nome + '.</p>' + reminderText + '<p><a href="' + link + '">Clique aqui para continuar</a>.</p><p>Este link expira em ' + validation.expira_em + '.</p>' });
 }
 
+function sendRegistrationInviteEmail(invite) {
+  var baseUrl = PropertiesService.getScriptProperties().getProperty(APP_CONFIG.FRONTEND_URL_PROPERTY);
+  if (!baseUrl) throw apiError('URL do frontend nao configurada.', 'CONFIGURATION_ERROR', 500);
+  var link = baseUrl + '/aceitar-convite.html?token=' + encodeURIComponent(invite.token);
+  MailApp.sendEmail({ to: invite.email, subject: 'Convite para criar seu acesso no Gatekeeper', htmlBody: '<p>Voce recebeu um convite para criar seu acesso.</p><p><a href="' + link + '">Criar minha senha</a></p><p>Este link pode ser usado uma unica vez e expira em ' + invite.expira_em + '.</p>' });
+}
+
+
+function sendValidationEmail(validation, user) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  try {
+    var properties = PropertiesService.getScriptProperties();
+    var queue = JSON.parse(properties.getProperty(APP_CONFIG.EMAIL_QUEUE_PROPERTY) || '[]');
+    if (queue.indexOf(validation.id_validacao) === -1) queue.push(validation.id_validacao);
+    properties.setProperty(APP_CONFIG.EMAIL_QUEUE_PROPERTY, JSON.stringify(queue));
+    var hasTrigger = ScriptApp.getProjectTriggers().some(function (trigger) { return trigger.getHandlerFunction() === APP_CONFIG.EMAIL_QUEUE_HANDLER; });
+    if (!hasTrigger) ScriptApp.newTrigger(APP_CONFIG.EMAIL_QUEUE_HANDLER).timeBased().after(1000).create();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function processEmailQueue() {
+  beginRequestContext();
+  var lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  var queue;
+  try {
+    var properties = PropertiesService.getScriptProperties();
+    queue = JSON.parse(properties.getProperty(APP_CONFIG.EMAIL_QUEUE_PROPERTY) || '[]');
+    properties.deleteProperty(APP_CONFIG.EMAIL_QUEUE_PROPERTY);
+    ScriptApp.getProjectTriggers().filter(function (trigger) { return trigger.getHandlerFunction() === APP_CONFIG.EMAIL_QUEUE_HANDLER; }).forEach(function (trigger) { ScriptApp.deleteTrigger(trigger); });
+  } finally {
+    lock.releaseLock();
+  }
+  queue.forEach(function (validationId) {
+    try {
+      var validation = findRow(APP_CONFIG.SHEETS.VALIDATIONS, function (item) { return item.id_validacao === validationId; });
+      if (!validation || validation.status !== VALIDATION_STATUS.PENDING || new Date(validation.expira_em).getTime() <= Date.now()) return;
+      var user = getUserById(validation.id_usuario);
+      if (!user) return;
+      deliverValidationEmail(validation, user);
+      logEvent('EMAIL_ENVIADO', user.id_usuario, 'Validation e-mail sent.');
+    } catch (error) {
+      logEvent('EMAIL_FALHOU', '', 'Queue processing failed: ' + error.message);
+    }
+  });
+}
+
+
+function ensureConfirmationReminderTrigger() {
+  var hasTrigger = ScriptApp.getProjectTriggers().some(function (trigger) { return trigger.getHandlerFunction() === APP_CONFIG.EMAIL_REMINDER_HANDLER; });
+  if (!hasTrigger) ScriptApp.newTrigger(APP_CONFIG.EMAIL_REMINDER_HANDLER).timeBased().everyHours(1).create();
+}
+
+function processRegistrationEmailReminders() {
+  beginRequestContext();
+  var now = Date.now();
+  var reminderAfterMs = APP_CONFIG.TOKEN_TTL_MS[VALIDATION_TYPE.REGISTRATION] / 2;
+  sheetRows(APP_CONFIG.SHEETS.VALIDATIONS).filter(function (validation) {
+    var createdAt = new Date(validation.criado_em).getTime();
+    var expiresAt = new Date(validation.expira_em).getTime();
+    return validation.tipo === VALIDATION_TYPE.REGISTRATION && validation.status === VALIDATION_STATUS.PENDING && !validation.lembrete_enviado_em && createdAt + reminderAfterMs <= now && expiresAt > now;
+  }).forEach(function (validation) {
+    try {
+      var user = getUserById(validation.id_usuario);
+      if (!user || user.status !== USER_STATUS.PENDING) return;
+      deliverValidationEmail(validation, user, true);
+      updateRow(APP_CONFIG.SHEETS.VALIDATIONS, validation._row, { lembrete_enviado_em: new Date() });
+      logEvent('LEMBRETE_CONFIRMACAO_ENVIADO', user.id_usuario, 'Lembrete de confirmação de cadastro enviado.');
+    } catch (error) {
+      logEvent('LEMBRETE_CONFIRMACAO_FALHOU', '', 'Falha ao enviar lembrete: ' + error.message);
+    }
+  });
+}
 
 // ===== backend\apps-script\services\ValidationService.gs =====
 function createValidation(user, type, value) {
@@ -179,7 +304,7 @@ function createValidation(user, type, value) {
   var now = new Date();
   var validation = {
     id_validacao: generateId(), id_usuario: user.id_usuario, tipo: type, valor: value || '', token: generateRandomToken(),
-    status: VALIDATION_STATUS.PENDING, criado_em: now, expira_em: new Date(now.getTime() + APP_CONFIG.TOKEN_TTL_MS[type]), utilizado_em: ''
+    status: VALIDATION_STATUS.PENDING, criado_em: now, expira_em: new Date(now.getTime() + APP_CONFIG.TOKEN_TTL_MS[type]), utilizado_em: '', lembrete_enviado_em: ''
   };
   insertRow(APP_CONFIG.SHEETS.VALIDATIONS, validation);
   return validation;
@@ -210,22 +335,32 @@ function createSession(userId) {
 }
 function requireSession(token) {
   if (!token) throw apiError('Autenticação obrigatória.', 'UNAUTHORIZED', 401);
-  var session = findRow(APP_CONFIG.SHEETS.SESSIONS, function (s) { return s.token === token; });
+  var cached = CacheService.getScriptCache().get(sessionCacheKey(token));
+  var session = cached ? JSON.parse(cached) : findRow(APP_CONFIG.SHEETS.SESSIONS, function (s) { return s.token === token; });
+  if (session && !cached) cacheSession(session);
   if (!session || session.status !== SESSION_STATUS.ACTIVE) throw apiError('Sessão inválida.', 'UNAUTHORIZED', 401);
   if (new Date(session.expira_em).getTime() <= Date.now()) {
     updateRow(APP_CONFIG.SHEETS.SESSIONS, session._row, { status: SESSION_STATUS.EXPIRED });
+    clearSessionCache(token);
     logEvent('SESSAO_EXPIRADA', session.id_usuario, 'Sessão expirada por inatividade.');
     throw apiError('Sessão expirada.', 'SESSION_EXPIRED', 401);
   }
   return session;
 }
+function sessionCacheKey(token) { return 'session:' + token; }
+function cacheSession(session) { CacheService.getScriptCache().put(sessionCacheKey(session.token), JSON.stringify(session), APP_CONFIG.SESSION_CACHE_TTL_SECONDS); }
+function clearSessionCache(token) { CacheService.getScriptCache().remove(sessionCacheKey(token)); }
 function renewSession(session) {
   var now = new Date();
   updateRow(APP_CONFIG.SHEETS.SESSIONS, session._row, { ultimo_acesso_em: now, expira_em: new Date(now.getTime() + APP_CONFIG.SESSION_TTL_MS) });
+  session.ultimo_acesso_em = now;
+  session.expira_em = new Date(now.getTime() + APP_CONFIG.SESSION_TTL_MS);
+  cacheSession(session);
 }
 function closeSession(token) {
   var session = requireSession(token);
   updateRow(APP_CONFIG.SHEETS.SESSIONS, session._row, { status: SESSION_STATUS.CLOSED, encerrado_em: new Date() });
+  clearSessionCache(token);
   logEvent('LOGOUT', session.id_usuario, 'Logout realizado.');
 }
 
@@ -234,6 +369,37 @@ function closeSession(token) {
 function publicUser(user) { return { id: user.id_usuario, name: user.nome, lastName: user.sobrenome, email: user.email, status: user.status }; }
 function getUserByEmail(email) { return findRow(APP_CONFIG.SHEETS.USERS, function (u) { return String(u.email).toLowerCase() === normalizeEmail(email); }); }
 function getUserById(userId) { return findRow(APP_CONFIG.SHEETS.USERS, function (u) { return u.id_usuario === userId; }); }
+
+function inviteAdminEmails() { return String(PropertiesService.getScriptProperties().getProperty(APP_CONFIG.INVITE_ADMIN_EMAILS_PROPERTY) || '').split(',').map(normalizeEmail).filter(function (email) { return !!email; }); }
+function requireInviteAdmin(token) {
+  var session = requireSession(token), user = getUserById(session.id_usuario);
+  if (!user || inviteAdminEmails().indexOf(normalizeEmail(user.email)) === -1) throw apiError('Voce nao tem permissao para enviar convites.', 'FORBIDDEN', 403);
+  return user;
+}
+function createRegistrationInvite(payload, token) {
+  requireFields(payload, ['email']); validateEmail(payload.email);
+  var admin = requireInviteAdmin(token), email = normalizeEmail(payload.email), now = new Date();
+  if (getUserByEmail(email)) throw apiError('Este e-mail ja possui uma conta.', 'EMAIL_ALREADY_EXISTS', 409);
+  sheetRows(APP_CONFIG.SHEETS.INVITES).filter(function (invite) { return invite.email === email && invite.status === INVITE_STATUS.PENDING; }).forEach(function (invite) { updateRow(APP_CONFIG.SHEETS.INVITES, invite._row, { status: INVITE_STATUS.REPLACED }); });
+  var invite = { id_convite: generateId(), email: email, token: generateRandomToken(), status: INVITE_STATUS.PENDING, criado_em: now, expira_em: new Date(now.getTime() + APP_CONFIG.TOKEN_TTL_MS[VALIDATION_TYPE.REGISTRATION]), utilizado_em: '', criado_por: admin.id_usuario };
+  insertRow(APP_CONFIG.SHEETS.INVITES, invite); sendRegistrationInviteEmail(invite); logEvent('CONVITE_CADASTRO_ENVIADO', admin.id_usuario, 'Convite enviado para ' + email + '.');
+  return success('Convite enviado para ' + email + '.');
+}
+function getUsableRegistrationInvite(token) {
+  var invite = findRow(APP_CONFIG.SHEETS.INVITES, function (item) { return item.token === token; });
+  if (!invite || invite.status !== INVITE_STATUS.PENDING) throw apiError('Convite invalido ou ja utilizado.', 'INVALID_INVITE', 400);
+  if (new Date(invite.expira_em).getTime() <= Date.now()) { updateRow(APP_CONFIG.SHEETS.INVITES, invite._row, { status: INVITE_STATUS.EXPIRED }); throw apiError('Convite expirado.', 'EXPIRED_INVITE', 400); }
+  return invite;
+}
+function acceptRegistrationInvite(payload) {
+  requireFields(payload, ['token', 'nome', 'sobrenome', 'senha', 'confirmarSenha']); validatePassword(payload.senha);
+  if (payload.senha !== payload.confirmarSenha) throw apiError('As senhas nao coincidem.', 'PASSWORD_MISMATCH', 400);
+  var invite = getUsableRegistrationInvite(payload.token);
+  if (getUserByEmail(invite.email)) throw apiError('Este e-mail ja possui uma conta.', 'EMAIL_ALREADY_EXISTS', 409);
+  var now = new Date(), user = { id_usuario: generateId(), nome: String(payload.nome).trim(), sobrenome: String(payload.sobrenome).trim(), email: invite.email, email_confirmado_em: now, senha_hash: hashPassword(payload.senha), status: USER_STATUS.ACTIVE, criado_em: now, ultimo_login_em: '' };
+  insertRow(APP_CONFIG.SHEETS.USERS, user); updateRow(APP_CONFIG.SHEETS.INVITES, invite._row, { status: INVITE_STATUS.USED, utilizado_em: now }); logEvent('CADASTRO_POR_CONVITE', user.id_usuario, 'Conta criada por convite.');
+  return success('Cadastro concluido. Voce ja pode entrar.', { user: publicUser(user) }, 201);
+}
 
 function register(payload) {
   requireFields(payload, ['nome', 'sobrenome', 'email', 'senha', 'confirmarSenha']); validateEmail(payload.email); validatePassword(payload.senha);
@@ -322,6 +488,8 @@ function resetPassword(payload) {
 function routeRequest(method, route, payload, token) {
   var routes = {
     'POST:register': function () { return register(payload); },
+    'POST:create-registration-invite': function () { return createRegistrationInvite(payload, token); },
+    'POST:accept-registration-invite': function () { return acceptRegistrationInvite(payload); },
     'POST:login': function () { return login(payload); },
     'POST:confirm-registration': function () { return confirmRegistration(payload.token); },
     'GET:verify-email': function () { return confirmRegistration(payload.token); },
@@ -352,6 +520,7 @@ function doGet(event) { return handleRequest('GET', event); }
 function doPost(event) { return handleRequest('POST', event); }
 
 function handleRequest(method, event) {
+  beginRequestContext();
   try {
     var params = (event && event.parameter) || {}, body = {};
     if (event && event.postData && event.postData.contents) body = JSON.parse(event.postData.contents);
@@ -366,5 +535,3 @@ function handleRequest(method, event) {
     return toApiResponse(failure('Não foi possível concluir a operação.', 'INTERNAL_ERROR', 500));
   }
 }
-
-

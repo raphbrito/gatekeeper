@@ -3,7 +3,7 @@ function createValidation(user, type, value) {
   var now = new Date();
   var validation = {
     id_validacao: generateId(), id_usuario: user.id_usuario, tipo: type, valor: value || '', token: generateRandomToken(),
-    status: VALIDATION_STATUS.PENDING, criado_em: now, expira_em: new Date(now.getTime() + APP_CONFIG.TOKEN_TTL_MS[type]), utilizado_em: ''
+    status: VALIDATION_STATUS.PENDING, criado_em: now, expira_em: new Date(now.getTime() + APP_CONFIG.TOKEN_TTL_MS[type]), utilizado_em: '', lembrete_enviado_em: ''
   };
   insertRow(APP_CONFIG.SHEETS.VALIDATIONS, validation);
   return validation;
